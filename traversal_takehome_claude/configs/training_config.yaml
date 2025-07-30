@@ -1,0 +1,100 @@
+# Training Configuration for Qwen-7B Fine-tuning
+
+# Model Configuration
+model:
+  name: "Qwen/Qwen-7B-Instruct"
+  max_seq_length: 2048
+  torch_dtype: "float16"
+  trust_remote_code: true
+
+# Dataset Configuration
+dataset:
+  name: "microsoft/orca-math-word-problems-200k"  # Placeholder for 350K reasoning traces
+  train_split_ratio: 0.95
+  max_samples: null  # Use all available data
+  preprocessing:
+    remove_duplicates: true
+    min_length: 50
+    max_length: 4096
+    filter_languages: ["python", "general"]
+
+# LoRA Configuration
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.1
+  target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+# Training Hyperparameters
+training:
+  learning_rate: 2e-4
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4
+  num_train_epochs: 3
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  
+  # Optimization
+  optim: "paged_adamw_32bit"
+  lr_scheduler_type: "cosine"
+  
+  # Mixed Precision
+  fp16: true
+  bf16: false
+  
+  # Gradient Checkpointing
+  gradient_checkpointing: true
+
+# Evaluation Configuration
+evaluation:
+  strategy: "steps"
+  eval_steps: 100
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+  load_best_model_at_end: true
+
+# Logging and Saving
+logging:
+  steps: 10
+  report_to: "wandb"
+  project_name: "qwen-7b-finetuning"
+
+saving:
+  strategy: "steps"
+  steps: 500
+  total_limit: 3
+  output_dir: "models/qwen-7b-finetuned"
+
+# Data Processing
+data_processing:
+  num_workers: 4
+  remove_unused_columns: false
+  dataloader_pin_memory: true
+
+# Hardware Configuration
+hardware:
+  device_map: "auto"
+  max_memory_per_gpu: "24GB"
+  
+# Reproducibility
+seed: 42
+
+# Monitoring Metrics
+metrics_to_track:
+  - "train_loss"
+  - "eval_loss"  
+  - "learning_rate"
+  - "train_runtime"
+  - "train_samples_per_second"
+  - "eval_runtime"
+  - "eval_samples_per_second"
+
+# Early Stopping
+early_stopping:
+  enabled: true
+  patience: 3
+  min_delta: 0.001
