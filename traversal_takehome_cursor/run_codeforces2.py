@@ -10,7 +10,7 @@ Key features
 * **Graceful resumption** – already‑finished problems are skipped.
 * **Smarter `extract_code`** – handles ````python` fences *and* raw output, so badly‑formatted generations no longer break evaluation.
 
-Usage
+Usage  
 -----
 ```bash
 python run_codeforces2.py \
