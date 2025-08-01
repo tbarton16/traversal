@@ -12,7 +12,7 @@ Key features
 
 Usage  
 -----
-```bash
+```bash 
 python run_codeforces2.py \
     --wandb_project qwen_cf_eval \
     --model Qwen/Qwen2.5-7B-Instruct \
