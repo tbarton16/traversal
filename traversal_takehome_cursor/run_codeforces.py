@@ -211,7 +211,7 @@ def write_result_to_file(worker_id: int, prob_id: str, prompt: str, raw_generati
     
     filename = f"{output_dir}/worker{worker_id}_{safe_prob_id}_result.json"
     VERBOSE = False
-    if VERBOSE:
+    if VERBOSE :
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(result_data, f, indent=2, ensure_ascii=False)
         
