@@ -26,23 +26,6 @@ export OMP_NUM_THREADS=1
 # DeepSpeed optimizations
 export DEEPSPEED_ACCELERATOR=cuda
 
-# Clear GPU memory before starting
-echo "Clearing GPU memory..."
-if command -v nvidia-smi &> /dev/null; then
-    nvidia-smi --gpu-reset || echo "Warning: Could not reset GPUs"
-fi
-
-python3 -c "
-import torch
-import gc
-if torch.cuda.is_available():
-    for i in range(torch.cuda.device_count()):
-        torch.cuda.set_device(i)
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-    gc.collect()
-    print(f'Cleared memory on {torch.cuda.device_count()} GPU(s)')
-"
 
 # Set output directory
 OUTPUT_DIR="${1:-/mnt/storage/qwen/lora_gpt_memory_optimized}"
@@ -59,12 +42,14 @@ echo "  Single GPU mode: ENABLED"
 echo "  Sequence length: 2048 tokens (experimental)"
 
 # Launch training with memory optimizations
-echo "Launching DeepSpeed training (single GPU, 2048 tokens)..."
-deepspeed --num_gpus=1 \
-    --master_port=29500 \
+echo "Launching DeepSpeed training (GPU 2, 2048 tokens)..."
+export RUN_NAME="test-run-5"
+CUDA_VISIBLE_DEVICES=3 deepspeed --num_gpus=1 \
+    --master_port=29502 \
     lora_gpt_2048_flash.py \
+    --output_dir /mnt/storage/qwen/$RUN_NAME \
     --max_seq_len 2048 \
-    --wandb_run_name "test-run-1"
+    --wandb_run_name $RUN_NAME \
     --deepspeed ds_gpt.json
 
 echo "Training completed successfully!"

@@ -27,7 +27,7 @@ warnings.filterwarnings("ignore")
 
 @dataclass
 class FlashAttentionArguments:
-    output_dir: str = field(default="/mnt/storage/qwen/flash_2048_lora")
+    output_dir: str = field(default="/mnt/storage/qwen/flash_2048_lora_no_resume")
     model_name: str = field(default="Qwen/Qwen2.5-7B-Instruct")
     dataset_name: str = field(default="open-r1/Mixture-of-Thoughts")
     max_seq_len: int = field(default=2048, metadata={"help": "Long sequence with Flash Attention"})
@@ -201,7 +201,7 @@ def main():
     gc.collect()
     
     # Conservative LoRA configuration for long sequences
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]  # Focus on attention
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj"]
     
     lora_cfg = LoraConfig(
         r=args.lora_r,
@@ -226,18 +226,7 @@ def main():
     # Enable input gradients for LoRA compatibility
     if hasattr(model, 'enable_input_require_grads'):
         model.enable_input_require_grads()
-    
-    # Ensure dtype consistency and verify gradient requirements
-    for name, param in model.named_parameters():
-        param.data = param.data.to(torch.bfloat16)
-        if param.requires_grad:
-            # Ensure gradients can be computed
-            param.retain_grad()
-    
-    for buffer in model.buffers():
-        if buffer.dtype in [torch.float32, torch.float16]:
-            buffer.data = buffer.data.to(torch.bfloat16)
-    
+
     if args.local_rank <= 0:
         model.print_trainable_parameters()
         print(f"Model loaded with max sequence length: {args.max_seq_len}")
@@ -304,6 +293,7 @@ def main():
         load_best_model_at_end=False,
         prediction_loss_only=True,
         include_inputs_for_metrics=False,
+        resume_from_checkpoint=False,  # Don't restart from checkpoint
         
         # Additional memory optimizations
         ddp_find_unused_parameters=False,
