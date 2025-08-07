@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Codeforces benchmark runner for Qwen-7B-Instruct 2.5 **with robust code extraction and detailed file output**.
+Codeforces benchmark runner for Qwen2.5-7B-Instruct **with LoRA adapter, quantization, and ChatML formatting**.
 
 Key features
 ------------
-* **Direct HuggingFace integration** – uses Qwen-7B-Instruct 2.5 via transformers library.
+* **Direct HuggingFace integration** – uses Qwen2.5-7B-Instruct with LoRA adapter and 4-bit quantization.
+* **LoRA adapter support** – uses PEFT library for efficient fine-tuned model loading.
+* **4-bit quantization** – BitsAndBytesConfig for memory-efficient inference.
+* **Flash Attention 2** – tries to use Flash Attention for better memory efficiency.
+* **ChatML prompt formatting** – uses the same format as lora_gpt_2048_flash.py training data.
+* **Execution timeout** – automatically stops code evaluation after 2 minutes to prevent hangs.
 * **Parallel processing** – multiple workers for concurrent model inference.
 * **Per‑worker wandb runs** – grouped so dashboards aggregate nicely.
 * **Graceful resumption** – already‑finished problems are skipped.
@@ -14,9 +19,24 @@ Key features
 Usage
 -----
 ```bash
+# With fresh LoRA adapter (default)
 python run_codeforces.py \
-    --wandb_project qwen7b_cf_eval \
-    --num_workers 2 \
+    --wandb_project qwen25_lora_cf_eval \
+    --num_workers 1 \
+    --output_dir results
+
+# With pre-trained LoRA model
+python run_codeforces.py \
+    --wandb_project qwen25_lora_cf_eval \
+    --lora_model_path /path/to/lora/model \
+    --num_workers 1 \
+    --output_dir results
+
+# Without LoRA (base model only)
+python run_codeforces.py \
+    --wandb_project qwen25_lora_cf_eval \
+    --disable_lora \
+    --num_workers 1 \
     --output_dir results
 ```
 """
@@ -32,15 +52,55 @@ import random
 import json
 import threading
 from multiprocessing import Manager
+import signal
+from contextlib import contextmanager
 
 from datasets import load_dataset
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, PeftModel, TaskType, prepare_model_for_kbit_training
 import wandb
+
+# ──────────────────────────────────────────────────────────────────────────
+# Timeout handling
+# ──────────────────────────────────────────────────────────────────────────
+
+class TimeoutError(Exception):
+    """Custom timeout exception"""
+    pass
+
+@contextmanager
+def timeout(seconds):
+    """Context manager for timeout handling"""
+    def signal_handler(signum, frame):
+        raise TimeoutError(f"Execution timed out after {seconds} seconds")
+    
+    # Set up the signal handler
+    old_handler = signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    
+    try:
+        yield
+    finally:
+        # Restore the old signal handler and cancel the alarm
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Prompt template
 # ──────────────────────────────────────────────────────────────────────────
+CHAT_TEMPLATE = "{header}{dialog}<|im_start|>assistant\n"
+
+def build_chat(messages):
+    """Convert HF chat format to ChatML string."""
+    parts = []
+    for message in messages:
+        role = message["role"]
+        content = message["content"].strip()
+        parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+    return "".join(parts)
+
+# Codeforces problem template (formatted as raw text for user message)
 PROMPT_TEMPLATE = """You are solving a Codeforces problem. Implement **only**
 
 the function: 
@@ -88,24 +148,22 @@ def extract_code(txt: str) -> str:
     return txt.strip()
 
 
-def generate_solution(model, tokenizer, prompt: str, max_tokens: int = 512) -> Tuple[str, str]:
-    """Generate candidate Python code using Qwen-7B-Instruct 2.5 and extract the relevant portion.
+def generate_solution(model, tokenizer, prompt: str, max_tokens: int = 2048) -> Tuple[str, str]:
+    """Generate candidate Python code using Qwen2.5-7B-Instruct with LoRA adapter and extract the relevant portion.
     
     Returns:
         Tuple of (extracted_code, raw_generation)
     """
     try:
-        # Format the prompt for Qwen chat template
+        # Format the prompt using ChatML template (like lora_gpt_2048_flash.py)
         messages = [
-            {"role": "system", "content": "You are a competitive programming expert. Generate clean, efficient Python code."},
             {"role": "user", "content": prompt}
         ]
         
-        # Apply chat template
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
+        # Use ChatML formatting instead of tokenizer.apply_chat_template
+        text = CHAT_TEMPLATE.format(
+            header="<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+            dialog=build_chat(messages),
         )
         
         # Tokenize
@@ -115,7 +173,7 @@ def generate_solution(model, tokenizer, prompt: str, max_tokens: int = 512) -> T
         with torch.no_grad():
             generated_ids = model.generate(
                 **model_inputs,
-                max_new_tokens=32768,
+                max_new_tokens=max_tokens,
                 temperature=0.6,
                 top_p=0.95,
                 do_sample=True,
@@ -138,13 +196,22 @@ def generate_solution(model, tokenizer, prompt: str, max_tokens: int = 512) -> T
         return fallback, fallback
 
 
-def evaluate_solution(code: str, tests: List[Dict[str, str]]) -> Tuple[float, str, List[Dict[str, str]]]:
-    """Evaluate solution and return accuracy, error message, and detailed test results."""
+def evaluate_solution(code: str, tests: List[Dict[str, str]], timeout_seconds: int = 120) -> Tuple[float, str, List[Dict[str, str]]]:
+    """Evaluate solution and return accuracy, error message, and detailed test results.
+    
+    Args:
+        code: The code to evaluate
+        tests: List of test cases
+        timeout_seconds: Maximum time allowed for execution (default: 120 seconds = 2 minutes)
+    """
     ns: Dict[str, object] = {}
     test_results = []
     
     try:
-        exec(code, ns)  # nosec
+        with timeout(timeout_seconds):
+            exec(code, ns)  # nosec
+    except TimeoutError as e:
+        return 0.0, f"timeout_error: {e}", test_results
     except Exception as e:  # pylint: disable=broad-except
         return 0.0, f"compile_error: {e}", test_results
 
@@ -153,24 +220,49 @@ def evaluate_solution(code: str, tests: List[Dict[str, str]]) -> Tuple[float, st
         return 0.0, "solve_not_found", test_results
 
     passed = 0
+    start_time = time.time()
+    
     for i, case in enumerate(tests):
-        try:
-            pred = solve_fn(case["input"].rstrip("\n"))
-            actual_output = str(pred).strip()
-            expected_output = case["output"].strip()
-            is_correct = actual_output.lower() == expected_output.lower()
-            
+        # Check if we've already exceeded the timeout
+        elapsed_time = time.time() - start_time
+        if elapsed_time > timeout_seconds:
             test_results.append({
                 "test_number": i + 1,
                 "input": case["input"],
                 "expected_output": case["output"],
-                "actual_output": str(pred),
-                "correct": is_correct
+                "actual_output": f"TIMEOUT_ERROR: Execution exceeded {timeout_seconds} seconds",
+                "correct": False
             })
-            
-            if is_correct:
-                passed += 1
+            return passed / len(tests), f"timeout_error: Execution exceeded {timeout_seconds} seconds", test_results
+        
+        try:
+            # Apply timeout to individual test case execution
+            with timeout(max(1, timeout_seconds - int(elapsed_time))):
+                pred = solve_fn(case["input"].rstrip("\n"))
+                actual_output = str(pred).strip()
+                expected_output = case["output"].strip()
+                is_correct = actual_output.lower() == expected_output.lower()
                 
+                test_results.append({
+                    "test_number": i + 1,
+                    "input": case["input"],
+                    "expected_output": case["output"],
+                    "actual_output": str(pred),
+                    "correct": is_correct
+                })
+                
+                if is_correct:
+                    passed += 1
+                    
+        except TimeoutError as e:
+            test_results.append({
+                "test_number": i + 1,
+                "input": case["input"],
+                "expected_output": case["output"],
+                "actual_output": f"TIMEOUT_ERROR: {e}",
+                "correct": False
+            })
+            return passed / len(tests), f"timeout_error: {e}", test_results
         except Exception as e:  # pylint: disable=broad-except
             test_results.append({
                 "test_number": i + 1,
@@ -210,7 +302,7 @@ def write_result_to_file(worker_id: int, prob_id: str, prompt: str, raw_generati
     }
     
     filename = f"{output_dir}/worker{worker_id}_{safe_prob_id}_result.json"
-    VERBOSE = False
+    VERBOSE = True
     if VERBOSE :
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(result_data, f, indent=2, ensure_ascii=False)
@@ -292,24 +384,126 @@ def log_to_shared_wandb(shared_state, problem_id: str, accuracy: float, error: s
 # ──────────────────────────────────────────────────────────────────────────
 
 def worker(worker_id: int, world_size: int, args, shared_state, wandb_config: dict, dataset_shard):
-    # Load model and tokenizer for Qwen-7B-Instruct 2.5
-    print(f"[Worker {worker_id}] Loading Qwen-7B-Instruct 2.5...", file=sys.stderr)
+    # Load model and tokenizer for Qwen-7B-Instruct 2.5 with LoRA and quantization
+    print(f"[Worker {worker_id}] Loading Qwen-7B-Instruct 2.5 with LoRA adapter and quantization...", file=sys.stderr)
     
-    device = f"cuda:{worker_id % torch.cuda.device_count()}" if torch.cuda.is_available() else "cpu"
+    # Force GPU 2 as requested by user
+    device = "cuda"
     print(f"[Worker {worker_id}] Using device: {device}", file=sys.stderr)
     
-    model_name = "Qwen/Qwen2.5-Coder-7B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
+    model_name = "Qwen/Qwen2.5-7B-Instruct"
+    
+    # Setup tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
         model_name,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map={"": device} if torch.cuda.is_available() else None,
-        trust_remote_code=True
+        trust_remote_code=True,
+        use_fast=False
     )
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    # 4-bit quantization configuration from lora_gpt_2048_flash.py
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_storage=torch.uint8,
+    )
+    
+    # Load base model with quantization
+    try:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            torch_dtype=torch.bfloat16,
+            device_map={"": device},
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            use_cache=False,
+            attn_implementation="flash_attention_2",  # Try Flash Attention
+        )
+        print(f"[Worker {worker_id}] ✅ Successfully loaded model with Flash Attention 2!", file=sys.stderr)
+    except Exception as e:
+        print(f"[Worker {worker_id}] ⚠️ Flash Attention 2 failed: {e}", file=sys.stderr)
+        print(f"[Worker {worker_id}] Falling back to standard attention", file=sys.stderr)
+        
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            torch_dtype=torch.bfloat16,
+            device_map={"": device},
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            use_cache=False,
+        )
+    
+    # Clear memory after model loading
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    
+    # LoRA handling based on arguments
+    if args.disable_lora:
+        print(f"[Worker {worker_id}] LoRA disabled - using base model only", file=sys.stderr)
+        model = base_model
+    elif args.lora_model_path:
+        print(f"[Worker {worker_id}] Loading pre-trained LoRA model from: {args.lora_model_path}", file=sys.stderr)
+        try:
+            model = PeftModel.from_pretrained(
+                base_model,
+                args.lora_model_path,
+                torch_dtype=torch.bfloat16,
+                device_map={"": device}
+            )
+            print(f"[Worker {worker_id}] ✅ Successfully loaded pre-trained LoRA model", file=sys.stderr)
+        except Exception as e:
+            print(f"[Worker {worker_id}] ❌ Failed to load LoRA model: {e}", file=sys.stderr)
+            print(f"[Worker {worker_id}] Falling back to base model without LoRA", file=sys.stderr)
+            model = base_model
+    else:
+        print(f"[Worker {worker_id}] Creating fresh LoRA adapter", file=sys.stderr)
+        # LoRA configuration (conservative for long sequences like in lora_gpt_2048_flash.py)
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        
+        lora_cfg = LoraConfig(
+            r=8,  # Moderate LoRA rank
+            lora_alpha=16,
+            target_modules=target_modules,
+            lora_dropout=0.1,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            use_rslora=True,
+            init_lora_weights="gaussian",
+        )
+        
+        # Prepare model for k-bit training and apply LoRA
+        model = prepare_model_for_kbit_training(
+            base_model,
+            use_gradient_checkpointing=False  # Disable for inference
+        )
+        model = get_peft_model(model, lora_cfg)
+        print(f"[Worker {worker_id}] ✅ Fresh LoRA adapter created", file=sys.stderr)
+    
+    # Print model info
+    if hasattr(model, 'print_trainable_parameters'):
+        print(f"[Worker {worker_id}] Model configuration:", file=sys.stderr)
+        model.print_trainable_parameters()
+    else:
+        print(f"[Worker {worker_id}] Using base model (no LoRA adapter)", file=sys.stderr)
+    
     model.eval()
     
-    print(f"[Worker {worker_id}] Starting with Qwen-7B-Instruct 2.5 on {device}", file=sys.stderr)
+    # Determine model description for logging
+    if args.disable_lora:
+        model_desc = "Qwen2.5-7B-Instruct (no LoRA)"
+    elif args.lora_model_path:
+        model_desc = f"Qwen2.5-7B-Instruct + pre-trained LoRA ({args.lora_model_path})"
+    else:
+        model_desc = "Qwen2.5-7B-Instruct + fresh LoRA"
+    
+    print(f"[Worker {worker_id}] Starting with {model_desc} on {device}", file=sys.stderr)
     print(f"[Worker {worker_id}] Dataset shard size: {len(dataset_shard)} problems", file=sys.stderr)
+    print(f"[Worker {worker_id}] Code execution timeout: {args.timeout} seconds", file=sys.stderr)
     
     # Add random seed for reproducibility
     random.seed(args.seed + worker_id)
@@ -333,12 +527,10 @@ def worker(worker_id: int, world_size: int, args, shared_state, wandb_config: di
             input_format=row["input_format"],
             output_format=row["output_format"],
         )
-        
-        # Small delay to prevent overheating/memory issues
-        time.sleep(0.1 + random.uniform(0, 0.2))
+
         
         code, raw_generation = generate_solution(model, tokenizer, prompt)
-        acc, err, test_results = evaluate_solution(code, row["official_tests"])
+        acc, err, test_results = evaluate_solution(code, row["official_tests"], args.timeout)
         
         # Write detailed results to file
         write_result_to_file(
@@ -386,7 +578,18 @@ def parse_args():
 
     p.add_argument("--num_workers", type=int, default=2, help="Number of parallel workers (reduced default for GPU memory)")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--output_dir", default="results", help="Directory to save detailed result files")
+    p.add_argument("--output_dir", default="results-new", help="Directory to save detailed result files")
+    
+    # LoRA configuration arguments
+    p.add_argument("--lora_model_path", type=str, default=None, 
+                   help="Path to pre-trained LoRA model directory or HuggingFace model name. If not provided, creates fresh LoRA adapter.")
+    p.add_argument("--disable_lora", action="store_true", 
+                   help="Disable LoRA adapter entirely and use base model only")
+    
+    # Execution timeout argument
+    p.add_argument("--timeout", type=int, default=120,
+                   help="Maximum time in seconds for code execution (default: 120 seconds = 2 minutes)")
+    
     return p.parse_args()
 
 
@@ -405,7 +608,7 @@ def main():
         print("CUDA not available, using CPU", file=sys.stderr)
 
     world_size = args.num_workers
-    print(f"Starting {world_size} workers for Qwen-7B-Instruct 2.5 evaluation", file=sys.stderr)
+    print(f"Starting {world_size} workers for Qwen2.5-7B-Instruct + LoRA evaluation", file=sys.stderr)
     print(f"Detailed results will be saved to: {args.output_dir}/", file=sys.stderr)
     
     # Load and shuffle the dataset in main process
@@ -438,12 +641,22 @@ def main():
 
     # Initialize single shared wandb run in main process
     wandb_run = None
+    
+    # Build tags based on LoRA configuration
+    tags = ["codeforces", "consolidated", "qwen2.5-7b-instruct", "quantized", f"{world_size}workers"]
+    if args.disable_lora:
+        tags.append("no-lora")
+    elif args.lora_model_path:
+        tags.extend(["pretrained-lora", "loaded-lora"])
+    else:
+        tags.extend(["fresh-lora", "random-lora"])
+        
     wandb_config = {
         'project': args.wandb_project,
         'entity': args.wandb_entity,
         'group': args.wandb_group or f"cf-{datetime.utcnow():%Y%m%dT%H%M%S}",
         'name': f"consolidated-run-{world_size}workers",
-        'tags': ["codeforces", "consolidated", "qwen-7b-instruct-2.5", f"{world_size}workers"],
+        'tags': tags,
         'config': vars(args)
     }
     

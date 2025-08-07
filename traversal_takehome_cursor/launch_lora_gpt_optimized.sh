@@ -42,10 +42,10 @@ echo "  Single GPU mode: ENABLED"
 echo "  Sequence length: 2048 tokens (experimental)"
 
 # Launch training with memory optimizations
-echo "Launching DeepSpeed training (GPU 2, 2048 tokens)..."
-export RUN_NAME="test-run-5"
-CUDA_VISIBLE_DEVICES=3 deepspeed --num_gpus=1 \
-    --master_port=29502 \
+export RUN_NAME="test-run-90percent2048"
+export CUDA_VISIBLE_DEVICES=7
+echo "Using GPU: $CUDA_VISIBLE_DEVICES"
+deepspeed --master_port=2950$CUDA_VISIBLE_DEVICES \
     lora_gpt_2048_flash.py \
     --output_dir /mnt/storage/qwen/$RUN_NAME \
     --max_seq_len 2048 \
