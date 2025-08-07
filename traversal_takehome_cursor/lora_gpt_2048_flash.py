@@ -177,8 +177,6 @@ def main():
     
     # Initialize wandb
     if args.local_rank <= 0:
-        print("Attempting 2048 token training with Flash Attention optimizations...")
-        print("WARNING: This may still cause OOM without Flash Attention support!")
         
         # Configure wandb tags
         wandb_tags = args.wandb_tags.split(",") if args.wandb_tags else []

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Codeforces benchmark runner for Qwen2.5-7B-Instruct **with LoRA adapter, quantization, and ChatML formatting**.
+Codeforces benchmark runner for Qwen2.5-7B-Instruct **with LoRA adapter, quantization, and ChatML formatting** - C++ VERSION.
 
 Key features
 ------------
@@ -9,11 +9,11 @@ Key features
 * **4-bit quantization** – BitsAndBytesConfig for memory-efficient inference.
 * **Flash Attention 2** – tries to use Flash Attention for better memory efficiency.
 * **ChatML prompt formatting** – uses the same format as lora_gpt_2048_flash.py training data.
-* **Execution timeout** – automatically stops code evaluation after 2 minutes to prevent hangs.
+* **C++ compilation and execution** – compiles and runs C++ solutions with timeout handling.
 * **Parallel processing** – multiple workers for concurrent model inference.
 * **Per‑worker wandb runs** – grouped so dashboards aggregate nicely.
 * **Graceful resumption** – already‑finished problems are skipped.
-* **Smarter `extract_code`** – handles ````python` fences *and* raw output, so badly‑formatted generations no longer break evaluation.
+* **Smarter `extract_code`** – handles ````cpp` fences *and* raw output, so badly‑formatted generations no longer break evaluation.
 * **Detailed file output** – saves prompt, generation, tests, and results to files for each problem.
 
 """
@@ -21,6 +21,8 @@ import argparse
 import os
 import re
 import sys
+import subprocess
+import tempfile
 from datetime import datetime
 from typing import Dict, List, Tuple
 import multiprocessing as mp
@@ -77,17 +79,24 @@ def build_chat(messages):
         parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
     return "".join(parts)
 
-# Codeforces problem template (formatted as raw text for user message)
+# Codeforces problem template (formatted for C++ solutions)
 PROMPT_TEMPLATE = """You will be given a competitive programming problem.
-Analyze the maximum input constraints and identify the optimal algorithmic approach and data structures needed to process the largest possible test cases within the time and memory limits, then explain why your chosen implementation strategy is the most efficient solution. Please reason step by step about your solution approach, then provide a complete implementation in Python 3 that is thoroughly optimized for both speed and memory usage.
+Analyze the maximum input constraints and identify the optimal algorithmic approach and data structures needed to process the largest possible test cases within the time and memory limits, then explain why your chosen implementation strategy is the most efficient solution. Please reason step by step about your solution approach, then provide a complete implementation in C++ that is thoroughly optimized for both speed and memory usage.
 
-Implement only the solve function, which takes one argument, the input string, and returns the output string.
+Your solution should be a complete C++ program that reads from standard input and writes to standard output. Include all necessary headers and use efficient I/O methods. Make sure to handle all edge cases and optimize for the given constraints.
 
 Put your final solution within a single code block:
-```python
-def solve(inp: str) -> str:
-    <your code here>
+```cpp
+#include <iostream>
+// ... other includes as needed ...
+using namespace std;
+
+int main() {{
+    // your code here
+    return 0;
+}}
 ```
+
 # Problem statement
 {description}
 # Input
@@ -101,22 +110,22 @@ def solve(inp: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────
 
 def extract_code(txt: str) -> str:
-    """Return the longest plausible code block.
+    """Return the longest plausible C++ code block.
 
-    1. Prefer ```python fenced blocks (common with LLMs).
-    2. Otherwise, grab everything starting at the first `def solve`.
+    1. Prefer ```cpp or ```c++ fenced blocks (common with LLMs).
+    2. Otherwise, grab everything starting at the first #include.
     3. Fall back to the full generation as‑is.
     """
     # 1️⃣ fenced blocks
-    blocks = re.findall(r"```(?:python)?\s*([\s\S]*?)```", txt, flags=re.IGNORECASE)
+    blocks = re.findall(r"```(?:cpp|c\+\+)?\s*([\s\S]*?)```", txt, flags=re.IGNORECASE)
     if blocks:
         # Pick the longest – usually the full solution
         candidate = max(blocks, key=len).strip()
         if candidate:
             return candidate
 
-    # 2️⃣ first def solve onwards
-    m = re.search(r"def\s+solve\s*\(", txt)
+    # 2️⃣ first #include onwards
+    m = re.search(r"#include\s*<", txt)
     if m:
         return txt[m.start():].strip()
 
@@ -125,7 +134,7 @@ def extract_code(txt: str) -> str:
 
 
 def generate_solution(model, tokenizer, prompt: str, max_tokens: int = 2048) -> Tuple[str, str]:
-    """Generate candidate Python code using Qwen2.5-7B-Instruct with LoRA adapter and extract the relevant portion.
+    """Generate candidate C++ code using Qwen2.5-7B-Instruct with LoRA adapter and extract the relevant portion.
     
     Returns:
         Tuple of (extracted_code, raw_generation)
@@ -168,86 +177,176 @@ def generate_solution(model, tokenizer, prompt: str, max_tokens: int = 2048) -> 
     except Exception as e:
         print(f"Model generation error: {e}", file=sys.stderr)
         # Return a minimal fallback solution
-        fallback = "def solve(inp: str) -> str: return ''"
+        fallback = "#include <iostream>\nusing namespace std;\nint main() { return 0; }"
         return fallback, fallback
 
 
-def evaluate_solution(code: str, tests: List[Dict[str, str]], timeout_seconds: int = 120) -> Tuple[float, str, List[Dict[str, str]]]:
-    """Evaluate solution and return accuracy, error message, and detailed test results.
+def compile_and_run_cpp(code: str, test_input: str, timeout_seconds: int = 30) -> Tuple[str, str, bool]:
+    """Compile and run C++ code with given input.
     
     Args:
-        code: The code to evaluate
+        code: C++ source code
+        test_input: Input to provide to the program
+        timeout_seconds: Maximum time for compilation + execution
+        
+    Returns:
+        Tuple of (output, error_message, success)
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        source_file = os.path.join(temp_dir, "solution.cpp")
+        executable_file = os.path.join(temp_dir, "solution")
+        
+        try:
+            # Write source code to file
+            with open(source_file, 'w', encoding='utf-8') as f:
+                f.write(code)
+            
+            # Compile with optimizations
+            compile_cmd = [
+                "g++", "-std=c++17", "-O2", "-Wall", "-Wextra",
+                source_file, "-o", executable_file
+            ]
+            
+            compile_start = time.time()
+            compile_process = subprocess.run(
+                compile_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds // 2  # Use half timeout for compilation
+            )
+            compile_time = time.time() - compile_start
+            
+            if compile_process.returncode != 0:
+                return "", f"COMPILE_ERROR: {compile_process.stderr}", False
+            
+            # Run the executable
+            remaining_timeout = max(1, timeout_seconds - int(compile_time))
+            run_process = subprocess.run(
+                [executable_file],
+                input=test_input,
+                capture_output=True,
+                text=True,
+                timeout=remaining_timeout
+            )
+            
+            if run_process.returncode != 0:
+                return "", f"RUNTIME_ERROR: {run_process.stderr}", False
+            
+            return run_process.stdout, "", True
+            
+        except subprocess.TimeoutExpired:
+            return "", f"TIMEOUT_ERROR: Exceeded {timeout_seconds} seconds", False
+        except Exception as e:
+            return "", f"EXECUTION_ERROR: {e}", False
+
+
+def evaluate_solution(code: str, tests: List[Dict[str, str]], timeout_seconds: int = 120) -> Tuple[float, str, List[Dict[str, str]]]:
+    """Evaluate C++ solution and return accuracy, error message, and detailed test results.
+    
+    Args:
+        code: The C++ code to evaluate
         tests: List of test cases
         timeout_seconds: Maximum time allowed for execution (default: 120 seconds = 2 minutes)
     """
-    ns: Dict[str, object] = {}
     test_results = []
     
+    # First, try to compile the code once
     try:
-        with timeout(timeout_seconds):
-            exec(code, ns)  # nosec
-    except TimeoutError as e:
-        return 0.0, f"timeout_error: {e}", test_results
-    except Exception as e:  # pylint: disable=broad-except
-        return 0.0, f"compile_error: {e}", test_results
-
-    solve_fn = ns.get("solve")
-    if solve_fn is None:
-        return 0.0, "solve_not_found", test_results
-
-    passed = 0
-    start_time = time.time()
-    
-    for i, case in enumerate(tests):
-        # Check if we've already exceeded the timeout
-        elapsed_time = time.time() - start_time
-        if elapsed_time > timeout_seconds:
-            test_results.append({
-                "test_number": i + 1,
-                "input": case["input"],
-                "expected_output": case["output"],
-                "actual_output": f"TIMEOUT_ERROR: Execution exceeded {timeout_seconds} seconds",
-                "correct": False
-            })
-            return passed / len(tests), f"timeout_error: Execution exceeded {timeout_seconds} seconds", test_results
-        
-        try:
-            # Apply timeout to individual test case execution
-            with timeout(max(1, timeout_seconds - int(elapsed_time))):
-                pred = solve_fn(case["input"].rstrip("\n"))
-                actual_output = str(pred).strip()
-                expected_output = case["output"].strip()
-                is_correct = actual_output.lower() == expected_output.lower()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_file = os.path.join(temp_dir, "solution.cpp")
+            executable_file = os.path.join(temp_dir, "solution")
+            
+            # Write source code to file
+            with open(source_file, 'w', encoding='utf-8') as f:
+                f.write(code)
+            
+            # Compile
+            compile_cmd = [
+                "g++", "-std=c++17", "-O2", "-Wall", "-Wextra",
+                source_file, "-o", executable_file
+            ]
+            
+            compile_process = subprocess.run(
+                compile_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30  # 30 seconds for compilation
+            )
+            
+            if compile_process.returncode != 0:
+                return 0.0, f"compile_error: {compile_process.stderr}", test_results
+            
+            # Now run tests
+            passed = 0
+            start_time = time.time()
+            
+            for i, case in enumerate(tests):
+                # Check if we've already exceeded the timeout
+                elapsed_time = time.time() - start_time
+                if elapsed_time > timeout_seconds:
+                    test_results.append({
+                        "test_number": i + 1,
+                        "input": case["input"],
+                        "expected_output": case["output"],
+                        "actual_output": f"TIMEOUT_ERROR: Execution exceeded {timeout_seconds} seconds",
+                        "correct": False
+                    })
+                    return passed / len(tests), f"timeout_error: Execution exceeded {timeout_seconds} seconds", test_results
                 
-                test_results.append({
-                    "test_number": i + 1,
-                    "input": case["input"],
-                    "expected_output": case["output"],
-                    "actual_output": str(pred),
-                    "correct": is_correct
-                })
-                
-                if is_correct:
-                    passed += 1
+                try:
+                    # Apply timeout to individual test case execution
+                    remaining_timeout = max(1, timeout_seconds - int(elapsed_time))
                     
-        except TimeoutError as e:
-            test_results.append({
-                "test_number": i + 1,
-                "input": case["input"],
-                "expected_output": case["output"],
-                "actual_output": f"TIMEOUT_ERROR: {e}",
-                "correct": False
-            })
-            return passed / len(tests), f"timeout_error: {e}", test_results
-        except Exception as e:  # pylint: disable=broad-except
-            test_results.append({
-                "test_number": i + 1,
-                "input": case["input"],
-                "expected_output": case["output"],
-                "actual_output": f"RUNTIME_ERROR: {e}",
-                "correct": False
-            })
-            return passed / len(tests), f"runtime_error: {e}", test_results
+                    run_process = subprocess.run(
+                        [executable_file],
+                        input=case["input"].rstrip("\n"),
+                        capture_output=True,
+                        text=True,
+                        timeout=remaining_timeout
+                    )
+                    
+                    if run_process.returncode != 0:
+                        actual_output = f"RUNTIME_ERROR: {run_process.stderr}"
+                        is_correct = False
+                    else:
+                        actual_output = run_process.stdout.strip()
+                        expected_output = case["output"].strip()
+                        is_correct = actual_output.lower() == expected_output.lower()
+                    
+                    test_results.append({
+                        "test_number": i + 1,
+                        "input": case["input"],
+                        "expected_output": case["output"],
+                        "actual_output": actual_output,
+                        "correct": is_correct
+                    })
+                    
+                    if is_correct:
+                        passed += 1
+                        
+                except subprocess.TimeoutExpired:
+                    test_results.append({
+                        "test_number": i + 1,
+                        "input": case["input"],
+                        "expected_output": case["output"],
+                        "actual_output": f"TIMEOUT_ERROR: Test case exceeded {remaining_timeout} seconds",
+                        "correct": False
+                    })
+                    return passed / len(tests), f"timeout_error: Test case timeout", test_results
+                except Exception as e:
+                    test_results.append({
+                        "test_number": i + 1,
+                        "input": case["input"],
+                        "expected_output": case["output"],
+                        "actual_output": f"RUNTIME_ERROR: {e}",
+                        "correct": False
+                    })
+                    return passed / len(tests), f"runtime_error: {e}", test_results
+                    
+    except subprocess.TimeoutExpired:
+        return 0.0, f"compile_timeout_error: Compilation exceeded 30 seconds", test_results
+    except Exception as e:
+        return 0.0, f"compile_error: {e}", test_results
             
     return passed / len(tests), "", test_results
 
@@ -301,7 +400,7 @@ def write_result_to_file(worker_id: int, prob_id: str, prompt: str, raw_generati
             f.write("="*80 + "\n")
             f.write(raw_generation)
             f.write("\n\n" + "="*80 + "\n")
-            f.write("EXTRACTED CODE:\n")
+            f.write("EXTRACTED C++ CODE:\n")
             f.write("="*80 + "\n")
             f.write(extracted_code)
             f.write("\n\n" + "="*80 + "\n")
@@ -361,7 +460,7 @@ def log_to_shared_wandb(shared_state, problem_id: str, accuracy: float, error: s
 
 def worker(worker_id: int, world_size: int, args, shared_state, wandb_config: dict, dataset_shard):
     # Load model and tokenizer for Qwen-7B-Instruct 2.5 with LoRA and quantization
-    print(f"[Worker {worker_id}] Loading Qwen-7B-Instruct 2.5 with LoRA adapter and quantization...", file=sys.stderr)
+    print(f"[Worker {worker_id}] Loading Qwen-7B-Instruct 2.5 with LoRA adapter and quantization for C++ generation...", file=sys.stderr)
     
     # Force GPU 2 as requested by user
     device = "cuda"
@@ -471,15 +570,23 @@ def worker(worker_id: int, world_size: int, args, shared_state, wandb_config: di
     
     # Determine model description for logging
     if args.disable_lora:
-        model_desc = "Qwen2.5-7B-Instruct (no LoRA)"
+        model_desc = "Qwen2.5-7B-Instruct (no LoRA) - C++ mode"
     elif args.lora_model_path:
-        model_desc = f"Qwen2.5-7B-Instruct + pre-trained LoRA ({args.lora_model_path})"
+        model_desc = f"Qwen2.5-7B-Instruct + pre-trained LoRA ({args.lora_model_path}) - C++ mode"
     else:
-        model_desc = "Qwen2.5-7B-Instruct + fresh LoRA"
+        model_desc = "Qwen2.5-7B-Instruct + fresh LoRA - C++ mode"
     
     print(f"[Worker {worker_id}] Starting with {model_desc} on {device}", file=sys.stderr)
     print(f"[Worker {worker_id}] Dataset shard size: {len(dataset_shard)} problems", file=sys.stderr)
-    print(f"[Worker {worker_id}] Code execution timeout: {args.timeout} seconds", file=sys.stderr)
+    print(f"[Worker {worker_id}] C++ compilation + execution timeout: {args.timeout} seconds", file=sys.stderr)
+    
+    # Check if g++ is available
+    try:
+        subprocess.run(["g++", "--version"], capture_output=True, check=True)
+        print(f"[Worker {worker_id}] ✅ g++ compiler available", file=sys.stderr)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print(f"[Worker {worker_id}] ❌ g++ compiler not found! Install build-essential or g++", file=sys.stderr)
+        return
     
     # Add random seed for reproducibility
     random.seed(args.seed + worker_id)
@@ -554,7 +661,7 @@ def parse_args():
 
     p.add_argument("--num_workers", type=int, default=2, help="Number of parallel workers (reduced default for GPU memory)")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--output_dir", default="results-new-prompt", help="Directory to save detailed result files")
+    p.add_argument("--output_dir", default="results-cpp", help="Directory to save detailed result files")
     
     # LoRA configuration arguments
     p.add_argument("--lora_model_path", type=str, default=None, 
@@ -564,7 +671,7 @@ def parse_args():
     
     # Execution timeout argument
     p.add_argument("--timeout", type=int, default=120,
-                   help="Maximum time in seconds for code execution (default: 120 seconds = 2 minutes)")
+                   help="Maximum time in seconds for C++ compilation + execution (default: 120 seconds = 2 minutes)")
     
     return p.parse_args()
 
@@ -584,7 +691,7 @@ def main():
         print("CUDA not available, using CPU", file=sys.stderr)
 
     world_size = args.num_workers
-    print(f"Starting {world_size} workers for Qwen2.5-7B-Instruct + LoRA evaluation", file=sys.stderr)
+    print(f"Starting {world_size} workers for Qwen2.5-7B-Instruct + LoRA C++ evaluation", file=sys.stderr)
     print(f"Detailed results will be saved to: {args.output_dir}/", file=sys.stderr)
     
     # Load and shuffle the dataset in main process
@@ -619,7 +726,7 @@ def main():
     wandb_run = None
     
     # Build tags based on LoRA configuration
-    tags = ["codeforces", "consolidated", "qwen2.5-7b-instruct", "quantized", f"{world_size}workers"]
+    tags = ["codeforces", "consolidated", "qwen2.5-7b-instruct", "quantized", "cpp", f"{world_size}workers"]
     if args.disable_lora:
         tags.append("no-lora")
     elif args.lora_model_path:
@@ -630,8 +737,8 @@ def main():
     wandb_config = {
         'project': args.wandb_project,
         'entity': args.wandb_entity,
-        'group': args.wandb_group or f"cf-{datetime.utcnow():%Y%m%dT%H%M%S}",
-        'name': f"consolidated-run-{world_size}workers",
+        'group': args.wandb_group or f"cf-cpp-{datetime.utcnow():%Y%m%dT%H%M%S}",
+        'name': f"consolidated-cpp-run-{world_size}workers",
         'tags': tags,
         'config': vars(args)
     }
@@ -730,7 +837,7 @@ def main():
                 })
             
             wandb_run.finish()
-            print(f"Final overall accuracy: {final_accuracy:.2%} ({shared_state['total_problems']} problems)", file=sys.stderr)
+            print(f"Final overall C++ accuracy: {final_accuracy:.2%} ({shared_state['total_problems']} problems)", file=sys.stderr)
         except Exception as e:
             print(f"Warning: Failed to log final summary: {e}", file=sys.stderr)
 
