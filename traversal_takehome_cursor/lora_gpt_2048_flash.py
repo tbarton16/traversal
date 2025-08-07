@@ -6,6 +6,8 @@ import os
 import argparse
 from dataclasses import dataclass, field
 from typing import Optional, Union
+import random
+import re
 
 import torch
 import wandb
@@ -20,8 +22,11 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 
+# Import code extraction function
+from run_codeforces_ckpt import extract_code
+
 # Memory optimization settings for long sequences
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
+os.environ["PYTORCH_CUDALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore")
 
@@ -39,6 +44,8 @@ class FlashAttentionArguments:
     lora_alpha: int = field(default=16)
     lora_dropout: float = field(default=0.1)
     deepspeed: str = field(default="ds_gpt_ultra_low_memory.json")
+    # Dataset processing configuration
+    code_extraction_probability: float = field(default=0.5, metadata={"help": "Probability of extracting code vs using full conversation (0.0-1.0)"})
     # Wandb configuration
     wandb_project: str = field(default="lora-gpt-2048-flash", metadata={"help": "WandB project name"})
     wandb_run_name: Optional[str] = field(default=None, metadata={"help": "WandB run name"})
@@ -57,18 +64,69 @@ def build_chat(messages):
     return "".join(parts)
 
 def get_long_sequence_dataset(tokenizer, args):
-    """Dataset processing optimized for long sequences."""
+    """Dataset processing optimized for long sequences with conditional code extraction."""
     
     def tokenize_fn(example):
         try:
             messages = example.get("messages", [])
             if not messages or len(messages) < 2:
-                return None
+                return {"input_ids": [], "labels": [], "skip": True}
+            
+            # Decide whether to extract code based on probability
+            should_extract_code = random.random() < args.code_extraction_probability
+            
+            if should_extract_code:
+                # Extract problem prompt (user message) and assistant response
+                user_message = None
+                assistant_message = None
                 
-            text = CHAT_TEMPLATE.format(
-                header="<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
-                dialog=build_chat(messages),
-            )
+                for msg in messages:
+                    if msg["role"] == "user":
+                        user_message = msg["content"]
+                    elif msg["role"] == "assistant":
+                        assistant_message = msg["content"]
+                
+                if not user_message or not assistant_message:
+                    return {"input_ids": [], "labels": [], "skip": True}
+                
+                # Extract code from assistant message
+                extracted_code = extract_code(assistant_message)
+                
+                # Check if meaningful code was extracted
+                if not extracted_code:
+                    return {"input_ids": [], "labels": [], "skip": True}
+                
+                # Skip if extract_code just returned the original text (fallback case)
+                if extracted_code.strip() == assistant_message.strip():
+                    return {"input_ids": [], "labels": [], "skip": True}
+                
+                # Additional filtering: ensure extracted code looks like actual code
+                code_lower = extracted_code.lower()
+                has_code_keywords = any(keyword in code_lower for keyword in [
+                    'def ', 'import ', 'class ', 'for ', 'while ', 'if ', 'else:', 'elif ',
+                    '#include', 'using namespace', 'int main()', 'function', 'var ', 'let ', 'const '
+                ])
+                
+                if not has_code_keywords:
+                    return {"input_ids": [], "labels": [], "skip": True}
+
+        
+                # Create formatted conversation with extracted code
+                formatted_messages = [
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": extracted_code}
+                ]
+                
+                text = CHAT_TEMPLATE.format(
+                    header="<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                    dialog=build_chat(formatted_messages),
+                )
+            else:
+                # Use original conversation format
+                text = CHAT_TEMPLATE.format(
+                    header="<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+                    dialog=build_chat(messages),
+                )
             
             tokens = tokenizer(
                 text,
@@ -80,17 +138,19 @@ def get_long_sequence_dataset(tokenizer, args):
             
             # Only keep sequences that are reasonably long
             if len(tokens["input_ids"]) < args.max_seq_len // 4:
-                return None
+                return {"input_ids": [], "labels": [], "skip": True}
                 
             tokens["labels"] = tokens["input_ids"].copy()
+            tokens["skip"] = False
             return tokens
         except Exception as e:
-            return None
+            return {"input_ids": [], "labels": [], "skip": True}
 
     ds = load_dataset(args.dataset_name, "code", split="train", streaming=True)
     ds = ds.shuffle(buffer_size=2000, seed=42)
     ds = ds.map(tokenize_fn, batched=False, remove_columns=ds.column_names)
-    ds = ds.filter(lambda x: x is not None)
+    ds = ds.filter(lambda x: not x.get("skip", False))
+    ds = ds.remove_columns(["skip"])
     
     return ds
 
@@ -141,6 +201,7 @@ def main():
                 "lora_alpha": args.lora_alpha,
                 "lora_dropout": args.lora_dropout,
                 "deepspeed_config": args.deepspeed,
+                "code_extraction_probability": args.code_extraction_probability,
             }
         )
         print(f"🔗 WandB tracking initialized: {args.wandb_project}")
@@ -201,7 +262,7 @@ def main():
     gc.collect()
     
     # Conservative LoRA configuration for long sequences
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj"]
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
     
     lora_cfg = LoraConfig(
         r=args.lora_r,
