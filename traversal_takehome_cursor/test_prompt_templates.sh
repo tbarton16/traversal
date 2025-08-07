@@ -113,22 +113,24 @@ run_test() {
 # Define the 4 different prompt templates
 
 # Template 1: Detailed Analysis (Original style)
-PROMPT_1="You will be given a competitive programming problem.
-Analyze the maximum input constraints and identify the optimal algorithmic approach and data structures needed to process the largest possible test cases within the time and memory limits, then explain why your chosen implementation strategy is the most efficient solution. Please reason step by step about your solution approach, then provide a complete implementation in Python 3 that is thoroughly optimized for both speed and memory usage.
+PROMPT_1="""You are solving a Codeforces problem. Implement **only**
 
-Implement only the solve function, which takes one argument, the input string, and returns the output string.
-
-Put your final solution within a single code block:
-\`\`\`python
+the function: 
+```python
 def solve(inp: str) -> str:
-    <your code here>
-\`\`\`
+    # Return the answer for this instance.
+```
+
+Use only the Python standard library. Be concise and don't elaborate too much just output the solution.
+
+---
 # Problem statement
 {description}
 # Input
 {input_format}
 # Output
-{output_format}"
+{output_format}
+"""
 
 # Template 2: Concise Direct (Similar to fast version)
 PROMPT_2="You are solving a Codeforces problem. Implement **only**
@@ -150,29 +152,32 @@ Use only the Python standard library. Be concise and don't elaborate too much ju
 {output_format}"
 
 # Template 3: Step-by-step approach
-PROMPT_3="Solve this Codeforces problem step by step:
+PROMPT_3="""You will be given a competitive programming problem.
+Analyze the maximum input constraints and identify the optimal algorithmic approach and data structures needed to process the largest possible test cases within the time and memory limits, then explain why your chosen implementation strategy is the most efficient solution. Please reason step by step about your solution approach, then provide a complete implementation in C++ that is thoroughly optimized for both speed and memory usage.
 
-1. Read and understand the problem constraints
-2. Identify the key algorithmic pattern
-3. Choose appropriate data structures  
-4. Implement an efficient solution
+Your solution should be a complete C++ program that reads from standard input and writes to standard output. Include all necessary headers and use efficient I/O methods. Make sure to handle all edge cases and optimize for the given constraints.
 
-Provide your solution as a single function:
-\`\`\`python
-def solve(inp: str) -> str:
-    # Your solution here
-\`\`\`
+Put your final solution within a single code block:
+```cpp
+#include <iostream>
+// ... other includes as needed ...
+using namespace std;
 
-Use only Python standard library. Focus on correctness and efficiency.
+int main() {{
+    // your code here
+    return 0;
+}}
+```
 
 # Problem statement
 {description}
 # Input
 {input_format}
 # Output
-{output_format}"
+{output_format}
+"""
 
-# Template 4: Competitive programming focused
+
 PROMPT_4="COMPETITIVE PROGRAMMING PROBLEM
 
 Constraints and efficiency are critical. Analyze time/space complexity before coding.
