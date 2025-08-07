@@ -322,7 +322,7 @@ fi
 if [ "$1" = "--dry-run" ]; then
     echo "🔍 DRY RUN - Showing planned experiments:"
     echo ""
-    local count=0
+    count=0
     for max_seq_len in "${MAX_SEQ_LEN_VALUES[@]}"; do
         for code_extraction_prob in "${CODE_EXTRACTION_PROB_VALUES[@]}"; do
             count=$((count + 1))
